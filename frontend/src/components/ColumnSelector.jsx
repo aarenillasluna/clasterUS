@@ -1,5 +1,5 @@
 const COVERAGE_THRESHOLDS = { high: 0.99, mid: 0.5 }
-const MAX_ENCODABLE_CARDINALITY = 50
+const MAX_GROUPBY_CARDINALITY = 100
 
 function coverageLabel(c) {
   if (c >= COVERAGE_THRESHOLDS.high) return { label: '100%', cls: 'bg-emerald-900/50 text-emerald-400 border-emerald-800/50' }
@@ -15,13 +15,12 @@ function shortName(name) {
 export default function ColumnSelector({
   schema,
   selectedColumns,
-  selectedCategoricalColumns,
+  groupByField,
   weights,
   onSelectionChange,
-  onCategoricalSelectionChange,
+  onGroupByChange,
   onWeightChange,
 }) {
-  // Build recommendation map from schema
   const recMap = Object.fromEntries(
     schema.columns.map((c) => [c.name, c.recommended_weight ?? 1.0])
   )
@@ -34,32 +33,26 @@ export default function ColumnSelector({
     )
   }
 
-  const toggleCat = (name) => {
-    onCategoricalSelectionChange(
-      selectedCategoricalColumns.includes(name)
-        ? selectedCategoricalColumns.filter((c) => c !== name)
-        : [...selectedCategoricalColumns, name],
-    )
-  }
-
   const applyRecommendations = () => {
-    const allSelected = [...selectedColumns, ...selectedCategoricalColumns]
-    allSelected.forEach((col) => {
-      onWeightChange(col, recMap[col] ?? 1.0)
-    })
+    selectedColumns.forEach((col) => onWeightChange(col, recMap[col] ?? 1.0))
   }
 
   const numericCols = schema.columns.filter((c) => c.dtype === 'numeric')
   const categoricalCols = schema.columns.filter((c) => c.dtype === 'categorical')
-  const encodableCols = categoricalCols.filter((c) => (c.cardinality ?? 999) <= MAX_ENCODABLE_CARDINALITY)
-  const highCardinalityCols = categoricalCols.filter((c) => (c.cardinality ?? 999) > MAX_ENCODABLE_CARDINALITY)
+
+  // Groupable: categorical with 2–MAX cardinality and decent coverage
+  const groupableCols = categoricalCols.filter(
+    (c) => (c.cardinality ?? 0) >= 2 && (c.cardinality ?? 999) <= MAX_GROUPBY_CARDINALITY && c.coverage >= 0.3
+  )
+  const highCardinalityCols = categoricalCols.filter(
+    (c) => (c.cardinality ?? 0) > MAX_GROUPBY_CARDINALITY || c.coverage < 0.3
+  )
 
   const commonNumeric = numericCols.filter((c) => c.coverage >= COVERAGE_THRESHOLDS.high)
   const partialNumeric = numericCols.filter((c) => c.coverage < COVERAGE_THRESHOLDS.high)
 
-  const allSelected = [...selectedColumns, ...selectedCategoricalColumns]
-  const hasCustomWeights = allSelected.some((col) => Math.abs((weights[col] ?? 1.0) - (recMap[col] ?? 1.0)) > 0.05)
-  const allMatchRec = allSelected.length > 0 && !hasCustomWeights
+  const allMatchRec = selectedColumns.length > 0 &&
+    selectedColumns.every((col) => Math.abs((weights[col] ?? 1.0) - (recMap[col] ?? 1.0)) < 0.06)
 
   return (
     <div className="space-y-4">
@@ -84,7 +77,7 @@ export default function ColumnSelector({
             </button>
             <span className="text-slate-700">·</span>
             <button
-              onClick={() => { onSelectionChange([]); onCategoricalSelectionChange([]) }}
+              onClick={() => onSelectionChange([])}
               className="text-slate-400 hover:text-slate-300 transition-colors"
             >
               Clear
@@ -131,58 +124,105 @@ export default function ColumnSelector({
           />
         )}
 
-        {/* Encodable categorical */}
-        {encodableCols.length > 0 && (
-          <div className="mt-5">
+        {/* Group By section */}
+        {groupableCols.length > 0 && (
+          <div className="mt-6 pt-5 border-t border-slate-800">
             <SectionLabel>
-              Categorical fields — encodable ({encodableCols.length})
-              <span className="ml-1.5 text-violet-400 font-normal normal-case">
-                · one-hot encoded for clustering
+              Group By
+              <span className="ml-1.5 text-cyan-400 font-normal normal-case text-xs">
+                · corre un K-Means independiente por cada valor único
               </span>
             </SectionLabel>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
-              {encodableCols.map((col) => (
-                <CatEncodableCard
-                  key={col.name}
-                  col={col}
-                  checked={selectedCategoricalColumns.includes(col.name)}
-                  recWeight={recMap[col.name]}
-                  onToggle={() => toggleCat(col.name)}
+
+            <div className="mt-3 space-y-2">
+              {/* None option */}
+              <label className={`flex items-center gap-3 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${
+                !groupByField
+                  ? 'border-slate-600 bg-slate-800'
+                  : 'border-slate-800 bg-slate-800/40 hover:bg-slate-800'
+              }`}>
+                <input
+                  type="radio"
+                  name="group_by"
+                  checked={!groupByField}
+                  onChange={() => onGroupByChange(null)}
+                  className="text-cyan-500 accent-cyan-500"
                 />
-              ))}
+                <span className="text-sm text-slate-400">Sin agrupación (clustering global)</span>
+              </label>
+
+              {groupableCols.map((col) => {
+                const selected = groupByField === col.name
+                const short = shortName(col.name)
+                const isLong = col.name !== short
+                return (
+                  <label
+                    key={col.name}
+                    className={`flex items-start gap-3 px-3 py-2.5 rounded-lg border cursor-pointer transition-all ${
+                      selected
+                        ? 'border-cyan-600/60 bg-cyan-900/20'
+                        : 'border-slate-800 bg-slate-800/40 hover:bg-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="group_by"
+                      checked={selected}
+                      onChange={() => onGroupByChange(col.name)}
+                      className="mt-0.5 accent-cyan-500 shrink-0"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`text-sm font-medium ${selected ? 'text-cyan-300' : 'text-slate-200'}`}>
+                          {short}
+                        </span>
+                        <span className={`text-xs px-1.5 py-0.5 rounded border font-medium shrink-0 ${
+                          selected
+                            ? 'bg-cyan-900/50 text-cyan-400 border-cyan-800/50'
+                            : 'bg-slate-700 text-slate-400 border-slate-600'
+                        }`}>
+                          {col.cardinality} grupos
+                        </span>
+                        <span className={`text-xs px-1.5 py-0.5 rounded border shrink-0 ${coverageLabel(col.coverage).cls}`}>
+                          {coverageLabel(col.coverage).label}
+                        </span>
+                      </div>
+                      {isLong && (
+                        <p className="text-xs text-slate-600 mt-0.5 truncate font-mono">{col.name}</p>
+                      )}
+                      <p className="text-xs text-slate-500 mt-0.5 truncate">
+                        {col.sample_values.map((v) => String(v)).join(', ')}
+                      </p>
+                    </div>
+                  </label>
+                )
+              })}
             </div>
+
+            {/* High-cardinality info */}
+            {highCardinalityCols.length > 0 && (
+              <p className="text-xs text-slate-600 mt-3">
+                {highCardinalityCols.length} campo{highCardinalityCols.length > 1 ? 's' : ''} con cardinalidad excesiva no mostrado{highCardinalityCols.length > 1 ? 's' : ''}
+              </p>
+            )}
           </div>
         )}
 
-        {/* High-cardinality categorical (not usable) */}
-        {highCardinalityCols.length > 0 && (
-          <div className="mt-5">
-            <SectionLabel dimmed>
-              High-cardinality fields ({highCardinalityCols.length}) — too many unique values for encoding
-            </SectionLabel>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
-              {highCardinalityCols.map((col) => (
-                <CatCard key={col.name} col={col} />
-              ))}
-            </div>
-          </div>
-        )}
-
-        {selectedColumns.length === 0 && selectedCategoricalColumns.length === 0 && (
+        {selectedColumns.length === 0 && (
           <div className="mt-5 bg-amber-900/20 border border-amber-800/40 text-amber-400 rounded-lg p-3 text-sm">
-            Select at least one field to run clustering.
+            Selecciona al menos un campo numérico para clustering.
           </div>
         )}
       </div>
 
       {/* Feature weights panel */}
-      {allSelected.length > 0 && (
+      {selectedColumns.length > 0 && (
         <div className="card">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-slate-300 font-semibold">
               Feature Weights
               <span className="ml-2 text-slate-500 font-normal text-sm">
-                — adjust relative influence on clustering distance
+                — influencia relativa en la distancia de clustering
               </span>
             </h3>
             <div className="flex items-center gap-3">
@@ -194,15 +234,14 @@ export default function ColumnSelector({
                     : 'border-violet-700 text-violet-400 hover:bg-violet-900/20'
                 }`}
                 disabled={allMatchRec}
-                title="Set all weights to the recommended values"
               >
-                {allMatchRec ? '✓ Using suggestions' : '✦ Apply suggestions'}
+                {allMatchRec ? '✓ Usando sugerencias' : '✦ Aplicar sugerencias'}
               </button>
               <button
-                onClick={() => allSelected.forEach((c) => onWeightChange(c, 1.0))}
+                onClick={() => selectedColumns.forEach((c) => onWeightChange(c, 1.0))}
                 className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
               >
-                Reset all
+                Reset
               </button>
             </div>
           </div>
@@ -215,18 +254,6 @@ export default function ColumnSelector({
                 recommendedWeight={recMap[col]}
                 onChange={(v) => onWeightChange(col, v)}
                 onRemove={() => onSelectionChange(selectedColumns.filter((c) => c !== col))}
-                badge="num"
-              />
-            ))}
-            {selectedCategoricalColumns.map((col) => (
-              <WeightRow
-                key={col}
-                col={col}
-                weight={weights[col] ?? 1.0}
-                recommendedWeight={recMap[col]}
-                onChange={(v) => onWeightChange(col, v)}
-                onRemove={() => onCategoricalSelectionChange(selectedCategoricalColumns.filter((c) => c !== col))}
-                badge="cat"
               />
             ))}
           </div>
@@ -271,10 +298,7 @@ function RecBadge({ weight }) {
     : weight <= 0.3 ? 'text-slate-500 border-slate-700 bg-slate-800/40'
     : 'text-violet-400 border-violet-800/50 bg-violet-900/20'
   return (
-    <span
-      className={`text-xs px-1.5 py-0.5 rounded border font-mono shrink-0 ${color}`}
-      title={`Suggested weight: ${weight}×`}
-    >
+    <span className={`text-xs px-1.5 py-0.5 rounded border font-mono shrink-0 ${color}`} title={`Suggested: ${weight}×`}>
       ✦{weight}×
     </span>
   )
@@ -286,13 +310,11 @@ function ColumnCard({ col, checked, recWeight, onToggle }) {
   const isLong = col.name !== short
 
   return (
-    <label
-      className={`flex items-start gap-3 p-3 rounded-lg border transition-all cursor-pointer ${
-        checked
-          ? 'border-indigo-600/60 bg-indigo-900/20 hover:bg-indigo-900/30'
-          : 'border-slate-800 bg-slate-800/40 hover:bg-slate-800 hover:border-slate-700'
-      }`}
-    >
+    <label className={`flex items-start gap-3 p-3 rounded-lg border transition-all cursor-pointer ${
+      checked
+        ? 'border-indigo-600/60 bg-indigo-900/20 hover:bg-indigo-900/30'
+        : 'border-slate-800 bg-slate-800/40 hover:bg-slate-800 hover:border-slate-700'
+    }`}>
       <input
         type="checkbox"
         checked={checked}
@@ -301,17 +323,11 @@ function ColumnCard({ col, checked, recWeight, onToggle }) {
       />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-slate-200 truncate" title={col.name}>
-            {short}
-          </span>
-          <span className={`text-xs px-1.5 py-0.5 rounded border font-medium shrink-0 ${cov.cls}`}>
-            {cov.label}
-          </span>
+          <span className="text-sm font-medium text-slate-200 truncate" title={col.name}>{short}</span>
+          <span className={`text-xs px-1.5 py-0.5 rounded border font-medium shrink-0 ${cov.cls}`}>{cov.label}</span>
           {checked && <RecBadge weight={recWeight} />}
         </div>
-        {isLong && (
-          <p className="text-xs text-slate-600 mt-0.5 truncate font-mono">{col.name}</p>
-        )}
+        {isLong && <p className="text-xs text-slate-600 mt-0.5 truncate font-mono">{col.name}</p>}
         <p className="text-xs text-slate-500 mt-0.5 truncate">
           {col.sample_values.map((v) => String(v)).join(', ')}
         </p>
@@ -320,79 +336,10 @@ function ColumnCard({ col, checked, recWeight, onToggle }) {
   )
 }
 
-function CatEncodableCard({ col, checked, recWeight, onToggle }) {
-  const cov = coverageLabel(col.coverage)
-  const short = shortName(col.name)
-  const isLong = col.name !== short
-
-  return (
-    <label
-      className={`flex items-start gap-3 p-3 rounded-lg border transition-all cursor-pointer ${
-        checked
-          ? 'border-violet-600/60 bg-violet-900/20 hover:bg-violet-900/30'
-          : 'border-slate-800 bg-slate-800/40 hover:bg-slate-800 hover:border-slate-700'
-      }`}
-    >
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={onToggle}
-        className="mt-0.5 rounded border-slate-600 bg-slate-700 text-violet-600 focus:ring-violet-500 focus:ring-offset-slate-900 shrink-0"
-      />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-slate-200 truncate" title={col.name}>
-            {short}
-          </span>
-          <span className={`text-xs px-1.5 py-0.5 rounded border font-medium shrink-0 ${cov.cls}`}>
-            {cov.label}
-          </span>
-          <span className="text-xs bg-violet-900/40 text-violet-400 border border-violet-800/50 px-1.5 py-0.5 rounded shrink-0">
-            {col.cardinality} vals
-          </span>
-          {checked && <RecBadge weight={recWeight} />}
-        </div>
-        {isLong && (
-          <p className="text-xs text-slate-600 mt-0.5 truncate font-mono">{col.name}</p>
-        )}
-        <p className="text-xs text-slate-500 mt-0.5 truncate">
-          {col.sample_values.map((v) => String(v)).join(', ')}
-        </p>
-      </div>
-    </label>
-  )
-}
-
-function CatCard({ col }) {
-  const cov = coverageLabel(col.coverage)
-  const short = shortName(col.name)
-  return (
-    <div className="flex items-start gap-3 p-3 rounded-lg border border-slate-800 opacity-40">
-      <div className="w-4 h-4 mt-0.5 rounded border border-slate-700 shrink-0" />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-slate-400 truncate">{short}</span>
-          <span className={`text-xs px-1.5 py-0.5 rounded border font-medium shrink-0 ${cov.cls}`}>
-            {cov.label}
-          </span>
-          {col.cardinality != null && (
-            <span className="text-xs bg-slate-700 text-slate-400 px-1.5 py-0.5 rounded shrink-0">
-              {col.cardinality} vals
-            </span>
-          )}
-        </div>
-        <p className="text-xs text-slate-600 mt-0.5 truncate">
-          {col.sample_values.map((v) => String(v)).join(', ')}
-        </p>
-      </div>
-    </div>
-  )
-}
-
-function WeightRow({ col, weight, recommendedWeight, onChange, onRemove, badge }) {
+function WeightRow({ col, weight, recommendedWeight, onChange, onRemove }) {
   const short = shortName(col)
   const rec = recommendedWeight ?? 1.0
-  const diffFromRec = Math.abs(weight - rec) > 0.05
+  const diffFromRec = Math.abs(weight - rec) > 0.06
 
   const weightColor =
     weight > 1.5 ? 'text-orange-400'
@@ -401,31 +348,20 @@ function WeightRow({ col, weight, recommendedWeight, onChange, onRemove, badge }
     : weight < 1.0 ? 'text-sky-400'
     : 'text-slate-400'
 
-  const trackColor =
-    weight > 1.0 ? '#f59e0b'
-    : weight < 1.0 ? '#60a5fa'
-    : '#6366f1'
+  const trackColor = weight > 1.0 ? '#f59e0b' : weight < 1.0 ? '#60a5fa' : '#6366f1'
 
   return (
     <div className="flex items-center gap-3">
       <button
         onClick={onRemove}
         className="text-slate-600 hover:text-red-400 transition-colors shrink-0 text-sm leading-none"
-        title="Remove feature"
+        title="Remove"
       >
         ×
       </button>
-      <div className="w-36 shrink-0 flex items-center gap-1.5 min-w-0">
-        <span
-          className="text-sm text-slate-300 truncate font-mono"
-          title={col}
-        >
-          {short}
-        </span>
-        {badge === 'cat' && (
-          <span className="text-xs bg-violet-900/40 text-violet-400 border border-violet-800/50 px-1 rounded shrink-0">cat</span>
-        )}
-      </div>
+      <span className="text-sm text-slate-300 w-36 truncate shrink-0 font-mono" title={col}>
+        {short}
+      </span>
       <div className="flex-1 flex items-center gap-2">
         <span className="text-xs text-slate-600 w-8 text-right shrink-0">0.1×</span>
         <input
@@ -457,12 +393,11 @@ function WeightRow({ col, weight, recommendedWeight, onChange, onRemove, badge }
             {v}×
           </button>
         ))}
-        {/* Recommended value quick-pick */}
-        {diffFromRec && rec !== 0.5 && rec !== 1 && rec !== 2 && rec !== 3 && rec !== 5 && (
+        {diffFromRec && ![0.5, 1, 2, 3, 5].some((v) => Math.abs(rec - v) < 0.05) && (
           <button
             onClick={() => onChange(rec)}
             className="text-xs px-1.5 py-0.5 rounded bg-violet-900/40 text-violet-400 border border-violet-800/50 hover:bg-violet-800/40 transition-colors"
-            title="Apply suggested weight"
+            title="Suggested weight"
           >
             ✦{rec}×
           </button>

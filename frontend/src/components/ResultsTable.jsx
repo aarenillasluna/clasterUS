@@ -1,21 +1,36 @@
 import { useState } from 'react'
-import { clusterColor } from '../utils/colors'
+import { clusterColor, groupHashColor } from '../utils/colors'
 
 const PAGE_SIZE = 25
 
 export default function ResultsTable({ points }) {
   const [page, setPage] = useState(0)
-  const [sortCol, setSortCol] = useState('_cluster')
+  const [sortCol, setSortCol] = useState(null)
   const [sortDir, setSortDir] = useState('asc')
 
   if (!points?.length) return null
 
+  const isGrouped = '_cluster_group' in points[0]
+
   const allCols = Object.keys(points[0])
-  const displayCols = ['_cluster', ...allCols.filter((c) => c !== '_cluster')]
+  const skipCols = new Set(isGrouped
+    ? ['_cluster', '_cluster_local', '_cluster_group']
+    : ['_cluster'])
+  const clusterCol = isGrouped ? '_cluster_group' : '_cluster'
+  const displayCols = [clusterCol, ...allCols.filter((c) => !skipCols.has(c))]
+
+  const effectiveSortCol = sortCol ?? clusterCol
 
   const sorted = [...points].sort((a, b) => {
-    const va = a[sortCol]
-    const vb = b[sortCol]
+    let va = a[effectiveSortCol]
+    let vb = b[effectiveSortCol]
+    // When grouped, sort by group first, then local cluster
+    if (isGrouped && effectiveSortCol === '_cluster_group') {
+      const cmpGroup = String(va ?? '').localeCompare(String(vb ?? ''))
+      if (cmpGroup !== 0) return sortDir === 'asc' ? cmpGroup : -cmpGroup
+      va = a['_cluster_local'] ?? 0
+      vb = b['_cluster_local'] ?? 0
+    }
     const cmp = va < vb ? -1 : va > vb ? 1 : 0
     return sortDir === 'asc' ? cmp : -cmp
   })
@@ -24,7 +39,7 @@ export default function ResultsTable({ points }) {
   const pageData = sorted.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
 
   const handleSort = (col) => {
-    if (sortCol === col) {
+    if (effectiveSortCol === col) {
       setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     } else {
       setSortCol(col)
@@ -34,16 +49,17 @@ export default function ResultsTable({ points }) {
   }
 
   const exportCSV = () => {
-    const header = displayCols.map((c) => (c === '_cluster' ? 'cluster' : c)).join(',')
+    const csvCols = isGrouped
+      ? ['_cluster_group', '_cluster_local', ...allCols.filter((c) => !skipCols.has(c))]
+      : displayCols
+    const header = csvCols.map((c) => (c === '_cluster' ? 'cluster' : c)).join(',')
     const rows = points.map((p) =>
-      displayCols
-        .map((c) => {
-          const v = p[c]
-          if (v == null) return ''
-          const s = String(v)
-          return s.includes(',') || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s
-        })
-        .join(','),
+      csvCols.map((c) => {
+        const v = p[c]
+        if (v == null) return ''
+        const s = String(v)
+        return s.includes(',') || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s
+      }).join(','),
     )
     const csv = [header, ...rows].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
@@ -78,8 +94,8 @@ export default function ResultsTable({ points }) {
                   className="text-left py-3 px-4 text-slate-400 font-medium cursor-pointer hover:text-slate-200 whitespace-nowrap select-none transition-colors"
                 >
                   <span className="inline-flex items-center gap-1">
-                    {col === '_cluster' ? 'Cluster' : col}
-                    {sortCol === col && (
+                    {colHeader(col, isGrouped)}
+                    {effectiveSortCol === col && (
                       <span className="text-indigo-400 text-xs">
                         {sortDir === 'asc' ? '↑' : '↓'}
                       </span>
@@ -90,32 +106,19 @@ export default function ResultsTable({ points }) {
             </tr>
           </thead>
           <tbody>
-            {pageData.map((row, i) => {
-              const cluster = row._cluster
-              const color = clusterColor(cluster)
-              const isNoise = cluster === -1
-              return (
-                <tr
-                  key={i}
-                  className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors"
-                >
-                  {displayCols.map((col) => (
-                    <td key={col} className="py-2.5 px-4 text-slate-300">
-                      {col === '_cluster' ? (
-                        <span
-                          className="inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold"
-                          style={{ backgroundColor: `${color}20`, color, border: `1px solid ${color}40` }}
-                        >
-                          {isNoise ? 'Noise' : `C ${cluster}`}
-                        </span>
-                      ) : (
-                        <span className="font-mono text-xs">{formatVal(row[col])}</span>
-                      )}
-                    </td>
-                  ))}
-                </tr>
-              )
-            })}
+            {pageData.map((row, i) => (
+              <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/20 transition-colors">
+                {displayCols.map((col) => (
+                  <td key={col} className="py-2.5 px-4 text-slate-300">
+                    {col === clusterCol ? (
+                      <ClusterBadge row={row} isGrouped={isGrouped} />
+                    ) : (
+                      <span className="font-mono text-xs">{formatVal(row[col])}</span>
+                    )}
+                  </td>
+                ))}
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
@@ -145,6 +148,42 @@ export default function ResultsTable({ points }) {
       )}
     </div>
   )
+}
+
+function ClusterBadge({ row, isGrouped }) {
+  if (isGrouped) {
+    const group = row._cluster_group ?? ''
+    const local = row._cluster_local ?? 0
+    const color = groupHashColor(group)
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold"
+        style={{ backgroundColor: `${color}20`, color, border: `1px solid ${color}40` }}
+      >
+        {group}
+        <span className="opacity-70">·</span>
+        <span>k={local}</span>
+      </span>
+    )
+  }
+
+  const cluster = row._cluster
+  const isNoise = cluster === -1
+  const color = clusterColor(cluster)
+  return (
+    <span
+      className="inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold"
+      style={{ backgroundColor: `${color}20`, color, border: `1px solid ${color}40` }}
+    >
+      {isNoise ? 'Noise' : `C ${cluster}`}
+    </span>
+  )
+}
+
+function colHeader(col, isGrouped) {
+  if (col === '_cluster_group') return isGrouped ? 'Group · Cluster' : 'Cluster'
+  if (col === '_cluster') return 'Cluster'
+  return col
 }
 
 function formatVal(v) {

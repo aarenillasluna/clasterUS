@@ -19,8 +19,8 @@ class ColumnInfo(BaseModel):
     null_count: int
     coverage: float
     sample_values: List[Any]
-    cardinality: Optional[int] = None          # unique values count (for categoricals)
-    recommended_weight: Optional[float] = None  # suggested weight based on discriminability
+    cardinality: Optional[int] = None
+    recommended_weight: Optional[float] = None
 
 
 class ParseResponse(BaseModel):
@@ -32,7 +32,7 @@ class ParseResponse(BaseModel):
 class ClusterRequest(BaseModel):
     data: Any
     columns: List[str]
-    categorical_columns: Optional[List[str]] = None  # low-cardinality cols to one-hot encode
+    group_by: Optional[str] = None          # categorical field → run 1 clustering per unique value
     weights: Optional[Dict[str, float]] = None
     algorithm: Literal["kmeans", "dbscan"] = "kmeans"
     n_clusters: Optional[int] = 3
@@ -63,3 +63,5 @@ class ClusterResponse(BaseModel):
     pca_coords: Optional[List[Dict[str, float]]]
     pca_variance_explained: Optional[float]
     dims: int
+    group_cluster_map: Optional[Dict[str, Any]] = None   # str(global_id) → {group, local}
+    group_by_field: Optional[str] = None

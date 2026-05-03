@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import Plotly from 'plotly.js-dist-min'
 import createPlotlyComponent from 'react-plotly.js/factory'
-import { clusterColor } from '../utils/colors'
+import { clusterColor, groupHashColor } from '../utils/colors'
 
 const Plot = createPlotlyComponent(Plotly)
 
@@ -14,12 +14,57 @@ const DARK = {
 }
 
 export default function ClusterChart({ results }) {
-  const { pca_coords, labels, pca_variance_explained } = results
+  const { pca_coords, labels, pca_variance_explained, group_cluster_map, group_by_field } = results
   const is3D = pca_coords?.[0]?.z !== undefined
+  const isGrouped = !!group_cluster_map
 
   const traces = useMemo(() => {
     if (!pca_coords) return []
 
+    if (isGrouped) {
+      // One trace per GROUP (colored by group), tooltip shows local cluster
+      const groups = {}
+      labels.forEach((globalLabel, i) => {
+        const info = group_cluster_map[String(globalLabel)]
+        const groupName = info?.group ?? String(globalLabel)
+        if (!groups[groupName]) groups[groupName] = { indices: [], color: groupHashColor(groupName) }
+        groups[groupName].indices.push(i)
+      })
+
+      return Object.entries(groups)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([groupName, { indices, color }]) => {
+          const xs = indices.map((i) => pca_coords[i].x)
+          const ys = indices.map((i) => pca_coords[i].y)
+          const texts = indices.map((i) => {
+            const info = group_cluster_map[String(labels[i])]
+            return `<b>${groupName}</b><br>Cluster ${info?.local ?? '?'}`
+          })
+
+          if (is3D) {
+            const zs = indices.map((i) => pca_coords[i].z)
+            return {
+              type: 'scatter3d',
+              mode: 'markers',
+              name: groupName,
+              x: xs, y: ys, z: zs,
+              marker: { size: 4, color, opacity: 0.8 },
+            }
+          }
+
+          return {
+            type: 'scatter',
+            mode: 'markers',
+            name: groupName,
+            x: xs, y: ys,
+            text: texts,
+            marker: { size: 7, color, opacity: 0.75, line: { width: 1, color: DARK.plot } },
+            hovertemplate: '%{text}<br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<extra></extra>',
+          }
+        })
+    }
+
+    // Non-grouped: one trace per cluster label
     const groups = {}
     labels.forEach((label, i) => {
       if (!groups[label]) groups[label] = []
@@ -41,9 +86,7 @@ export default function ClusterChart({ results }) {
             type: 'scatter3d',
             mode: 'markers',
             name,
-            x: xs,
-            y: ys,
-            z: zs,
+            x: xs, y: ys, z: zs,
             marker: { size: 4, color, opacity: 0.85 },
           }
         }
@@ -52,18 +95,12 @@ export default function ClusterChart({ results }) {
           type: 'scatter',
           mode: 'markers',
           name,
-          x: xs,
-          y: ys,
-          marker: {
-            size: 8,
-            color,
-            opacity: 0.8,
-            line: { width: 1, color: DARK.plot },
-          },
+          x: xs, y: ys,
+          marker: { size: 8, color, opacity: 0.8, line: { width: 1, color: DARK.plot } },
           hovertemplate: `<b>${name}</b><br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<extra></extra>`,
         }
       })
-  }, [pca_coords, labels, is3D])
+  }, [pca_coords, labels, is3D, isGrouped, group_cluster_map])
 
   const axisStyle = {
     gridcolor: DARK.grid,
@@ -81,16 +118,14 @@ export default function ClusterChart({ results }) {
       bordercolor: '#334155',
       borderwidth: 1,
       font: { color: '#cbd5e1' },
+      // Scroll when many groups
+      ...(Object.keys(traces).length > 15 ? { orientation: 'h', y: -0.15 } : {}),
     },
     margin: { t: 20, r: 20, b: 50, l: 50 },
     xaxis: { ...axisStyle, title: { text: 'PC 1', font: { color: '#64748b' } } },
     yaxis: { ...axisStyle, title: { text: 'PC 2', font: { color: '#64748b' } } },
     autosize: true,
-    hoverlabel: {
-      bgcolor: '#1e293b',
-      bordercolor: '#475569',
-      font: { color: '#e2e8f0' },
-    },
+    hoverlabel: { bgcolor: '#1e293b', bordercolor: '#475569', font: { color: '#e2e8f0' } },
   }
 
   if (is3D) {
@@ -122,6 +157,11 @@ export default function ClusterChart({ results }) {
           <span className="text-slate-500 font-normal text-sm">
             ({is3D ? '3D' : '2D'} PCA projection)
           </span>
+          {isGrouped && group_by_field && (
+            <span className="ml-2 text-cyan-400 font-normal text-sm">
+              · grouped by {group_by_field.split('.').pop()}
+            </span>
+          )}
         </h3>
         {pca_variance_explained != null && (
           <span className="text-xs bg-slate-800 border border-slate-700 text-slate-400 px-2.5 py-1 rounded-full">

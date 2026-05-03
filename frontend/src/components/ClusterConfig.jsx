@@ -2,7 +2,8 @@ export default function ClusterConfig({
   config,
   onConfigChange,
   selectedCount,
-  selectedCategoricalCount,
+  groupByField,
+  groupByCardinality,
   weights,
   onRun,
   loading,
@@ -10,7 +11,9 @@ export default function ClusterConfig({
   const set = (key, value) => onConfigChange({ ...config, [key]: value })
 
   const customWeights = Object.values(weights ?? {}).filter((w) => Math.abs(w - 1.0) > 0.05)
-  const totalSelected = selectedCount + (selectedCategoricalCount ?? 0)
+  const estimatedTotal = groupByField && groupByCardinality
+    ? groupByCardinality * config.n_clusters
+    : null
 
   return (
     <div className="card sticky top-24">
@@ -39,7 +42,7 @@ export default function ClusterConfig({
       {config.algorithm === 'kmeans' && (
         <div className="mb-6">
           <FieldLabel>
-            Clusters{' '}
+            Clusters por grupo{' '}
             <span className="text-indigo-400 font-bold normal-case">k = {config.n_clusters}</span>
           </FieldLabel>
           <input
@@ -55,7 +58,6 @@ export default function ClusterConfig({
             <span>50</span>
           </div>
 
-          {/* Quick picks */}
           <div className="mt-3 grid grid-cols-5 gap-1">
             {[3, 5, 8, 10, 15].map((k) => (
               <button
@@ -72,7 +74,6 @@ export default function ClusterConfig({
             ))}
           </div>
 
-          {/* Free input for any k */}
           <div className="mt-3 flex items-center gap-2">
             <label className="text-xs text-slate-500 shrink-0">Custom k:</label>
             <input
@@ -118,37 +119,40 @@ export default function ClusterConfig({
         </div>
       )}
 
-      {/* Weights / categorical summary */}
-      {(customWeights.length > 0 || (selectedCategoricalCount ?? 0) > 0) && (
-        <div className="mb-4 space-y-2">
-          {customWeights.length > 0 && (
-            <div className="bg-amber-900/20 border border-amber-800/40 rounded-lg p-3">
-              <p className="text-xs text-amber-400 font-medium">
-                {customWeights.length} feature{customWeights.length > 1 ? 's' : ''} with custom weight
-              </p>
-            </div>
+      {/* Group By summary */}
+      {groupByField && (
+        <div className="mb-4 bg-cyan-900/20 border border-cyan-800/40 rounded-lg p-3">
+          <p className="text-xs text-cyan-400 font-medium flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full" />
+            Agrupado por{' '}
+            <span className="font-mono">{groupByField.split('.').pop()}</span>
+          </p>
+          {groupByCardinality != null && (
+            <p className="text-xs text-cyan-600 mt-1">
+              {groupByCardinality} grupos × k={config.n_clusters} ≈{' '}
+              <span className="font-semibold text-cyan-500">{estimatedTotal} clusters</span>
+            </p>
           )}
-          {(selectedCategoricalCount ?? 0) > 0 && (
-            <div className="bg-violet-900/20 border border-violet-800/40 rounded-lg p-3">
-              <p className="text-xs text-violet-400 font-medium">
-                {selectedCategoricalCount} categorical field{selectedCategoricalCount > 1 ? 's' : ''} will be one-hot encoded
-              </p>
-            </div>
-          )}
+        </div>
+      )}
+
+      {/* Custom weights summary */}
+      {customWeights.length > 0 && (
+        <div className="mb-4 bg-amber-900/20 border border-amber-800/40 rounded-lg p-3">
+          <p className="text-xs text-amber-400 font-medium">
+            {customWeights.length} feature{customWeights.length > 1 ? 's' : ''} with custom weight
+          </p>
         </div>
       )}
 
       <div className="pt-5 border-t border-slate-800">
         <p className="text-sm text-slate-400 mb-4">
-          <span className="font-semibold text-slate-200">{selectedCount}</span> numeric
-          {(selectedCategoricalCount ?? 0) > 0 && (
-            <> + <span className="font-semibold text-violet-400">{selectedCategoricalCount}</span> categorical</>
-          )}{' '}
-          feature{totalSelected !== 1 ? 's' : ''} selected
+          <span className="font-semibold text-slate-200">{selectedCount}</span>{' '}
+          feature{selectedCount !== 1 ? 's' : ''} seleccionada{selectedCount !== 1 ? 's' : ''}
         </p>
         <button
           onClick={onRun}
-          disabled={totalSelected === 0 || loading}
+          disabled={selectedCount === 0 || loading}
           className="btn-primary w-full flex items-center justify-center gap-2"
         >
           {loading ? (
@@ -160,7 +164,7 @@ export default function ClusterConfig({
             'Run Clustering →'
           )}
         </button>
-        {totalSelected === 0 && (
+        {selectedCount === 0 && (
           <p className="text-xs text-amber-500 text-center mt-2">
             Select at least one feature first
           </p>

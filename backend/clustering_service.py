@@ -14,7 +14,6 @@ from models import ColumnInfo, ClusterRequest, ClusterResponse, ParseResponse
 # ---------------------------------------------------------------------------
 
 def flatten_record(obj: Any, prefix: str = "", sep: str = ".") -> Dict[str, Any]:
-    """Recursively flatten nested dicts/lists into dot-notation leaf keys."""
     result: Dict[str, Any] = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -28,14 +27,12 @@ def flatten_record(obj: Any, prefix: str = "", sep: str = ".") -> Dict[str, Any]
                 result[f"{prefix}{sep}{i}" if prefix else str(i)] = v
         elif all(isinstance(x, str) for x in obj):
             result[prefix] = ", ".join(obj)
-        # array of objects → skip
     else:
         result[prefix] = obj
     return result
 
 
 def find_record_arrays(obj: Any, path: str = "") -> List[Tuple[str, List]]:
-    """BFS: collect every array-of-objects found anywhere in obj."""
     found = []
     if isinstance(obj, list) and obj and isinstance(obj[0], dict):
         found.append((path or "root", obj))
@@ -47,7 +44,6 @@ def find_record_arrays(obj: Any, path: str = "") -> List[Tuple[str, List]]:
 
 
 def auto_detect_records(data: Any) -> Tuple[str, List[Dict]]:
-    """Return (detected_path, records) for the largest array-of-objects in data."""
     candidates = find_record_arrays(data)
     if not candidates:
         raise ValueError(
@@ -67,7 +63,6 @@ def auto_detect_records(data: Any) -> Tuple[str, List[Dict]]:
 # ---------------------------------------------------------------------------
 
 def _recommend_weight(series: pd.Series, dtype: str) -> float:
-    """Suggest a weight based on how much variance/discrimination this feature offers."""
     non_null = series.dropna()
     if len(non_null) < 2:
         return 0.5
@@ -93,16 +88,14 @@ def _recommend_weight(series: pd.Series, dtype: str) -> float:
     std = float(nums.std())
 
     if total_range < 1e-9 or std < 1e-9:
-        return 0.1  # effectively constant
+        return 0.1
 
     med = float(nums.median())
     iqr = float(nums.quantile(0.75) - nums.quantile(0.25))
 
-    # Binary / 0-1 feature
     if total_range <= 1.01 and float(nums.min()) >= -0.01:
         return round(min(1.5, 0.5 + iqr), 1)
 
-    # Robust CV: IQR / |median| when median is large enough
     if abs(med) > 1.0:
         robust_cv = iqr / abs(med)
     else:
@@ -158,6 +151,62 @@ def parse_schema(data: Any) -> ParseResponse:
 
 
 # ---------------------------------------------------------------------------
+# Grouped clustering helper
+# ---------------------------------------------------------------------------
+
+def _grouped_clustering(
+    X_scaled: np.ndarray,
+    group_col: pd.Series,
+    request: ClusterRequest,
+) -> Tuple[List[int], Dict[str, Any], float]:
+    """Run a separate clustering per unique value of group_col.
+    Returns (global_labels, group_cluster_map, total_inertia).
+    global_labels: each record gets a unique integer that identifies (group, local_cluster).
+    group_cluster_map: str(global_id) → {"group": str, "local": int}
+    """
+    n = len(X_scaled)
+    labels: List[int] = [-1] * n
+    global_id = 0
+    group_cluster_map: Dict[str, Any] = {}
+    total_inertia = 0.0
+
+    for group_val in sorted(group_col.unique()):
+        mask = (group_col == group_val).values
+        indices = np.where(mask)[0]
+
+        if len(indices) < 2:
+            gid = global_id
+            group_cluster_map[str(gid)] = {"group": group_val, "local": 0}
+            for idx in indices:
+                labels[int(idx)] = gid
+            global_id += 1
+            continue
+
+        X_group = X_scaled[indices]
+        k = max(2, min(request.n_clusters, len(indices) - 1))
+
+        if request.algorithm == "kmeans":
+            model = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            grp_labels = model.fit_predict(X_group)
+            total_inertia += float(model.inertia_)
+        else:
+            model = DBSCAN(eps=request.eps, min_samples=request.min_samples)
+            grp_labels = model.fit_predict(X_group)
+
+        local_to_global: Dict[int, int] = {}
+        for local_lbl in sorted(set(int(l) for l in grp_labels)):
+            gid = global_id
+            group_cluster_map[str(gid)] = {"group": group_val, "local": local_lbl}
+            local_to_global[local_lbl] = gid
+            global_id += 1
+
+        for i, idx in enumerate(indices):
+            labels[int(idx)] = local_to_global[int(grp_labels[i])]
+
+    return labels, group_cluster_map, total_inertia
+
+
+# ---------------------------------------------------------------------------
 # Clustering
 # ---------------------------------------------------------------------------
 
@@ -166,10 +215,9 @@ def run_clustering(request: ClusterRequest) -> ClusterResponse:
     flat = [flatten_record(r) for r in records]
     df = pd.DataFrame(flat)
 
-    # --- Numeric features ---
-    missing_num = [c for c in request.columns if c not in df.columns]
-    if missing_num:
-        raise ValueError(f"Columns not found in data: {missing_num}")
+    missing = [c for c in request.columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Columns not found in data: {missing}")
 
     selected = df[request.columns].copy()
     for col in selected.columns:
@@ -178,51 +226,40 @@ def run_clustering(request: ClusterRequest) -> ClusterResponse:
     imputer = SimpleImputer(strategy="median")
     X_num = imputer.fit_transform(selected)
 
-    scaler_num = StandardScaler()
-    X_scaled = scaler_num.fit_transform(X_num)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_num)
 
     if request.weights:
         for i, c in enumerate(request.columns):
             X_scaled[:, i] *= max(0.01, request.weights.get(c, 1.0))
 
-    # --- Categorical features (one-hot encoded) ---
-    if request.categorical_columns:
-        missing_cat = [c for c in request.categorical_columns if c not in df.columns]
-        if missing_cat:
-            raise ValueError(f"Categorical columns not found: {missing_cat}")
+    # --- Clusterin (grouped or flat) ---
+    group_cluster_map: Optional[Dict[str, Any]] = None
+    group_by_field: Optional[str] = None
+    inertia: Optional[float] = None
 
-        cat_parts = []
-        cat_col_origins = []  # parallel list: which original col each dummy column belongs to
-
-        for orig_col in request.categorical_columns:
-            col_series = df[orig_col].fillna("__missing__").astype(str)
-            col_dummies = pd.get_dummies(col_series, dtype=float)
-            for _ in col_dummies.columns:
-                cat_col_origins.append(orig_col)
-            cat_parts.append(col_dummies)
-
-        cat_df = pd.concat(cat_parts, axis=1)
-        scaler_cat = StandardScaler()
-        X_cat = scaler_cat.fit_transform(cat_df)
-
-        for j, orig_col in enumerate(cat_col_origins):
-            w = max(0.01, request.weights.get(orig_col, 1.0)) if request.weights else 1.0
-            X_cat[:, j] *= w
-
-        X_scaled = np.hstack([X_scaled, X_cat])
-
-    # --- Clustering ---
-    inertia = None
-    if request.algorithm == "kmeans":
-        k = min(request.n_clusters, len(X_scaled) - 1)
-        model = KMeans(n_clusters=k, random_state=42, n_init="auto")
-        labels = model.fit_predict(X_scaled).tolist()
-        inertia = float(model.inertia_)
+    if request.group_by:
+        if request.group_by not in df.columns:
+            raise ValueError(f"Group-by column '{request.group_by}' not found in data")
+        group_by_field = request.group_by
+        group_col = df[request.group_by].fillna("__missing__").astype(str)
+        labels_list, group_cluster_map, total_inertia = _grouped_clustering(
+            X_scaled, group_col, request
+        )
+        labels = labels_list
+        if request.algorithm == "kmeans":
+            inertia = total_inertia
     else:
-        model = DBSCAN(eps=request.eps, min_samples=request.min_samples)
-        labels = model.fit_predict(X_scaled).tolist()
+        if request.algorithm == "kmeans":
+            k = min(request.n_clusters, len(X_scaled) - 1)
+            model = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = model.fit_predict(X_scaled).tolist()
+            inertia = float(model.inertia_)
+        else:
+            model = DBSCAN(eps=request.eps, min_samples=request.min_samples)
+            labels = model.fit_predict(X_scaled).tolist()
 
-    # --- PCA for visualization ---
+    # --- PCA for visualization (always on the full dataset) ---
     n_features = X_scaled.shape[1]
     n_components = min(3, n_features)
     pca_coords: Optional[List[Dict[str, float]]] = None
@@ -256,6 +293,10 @@ def run_clustering(request: ClusterRequest) -> ClusterResponse:
     for i, rec in enumerate(flat):
         point = {k: v for k, v in rec.items()}
         point["_cluster"] = int(labels[i])
+        if group_cluster_map:
+            info = group_cluster_map.get(str(labels[i]), {})
+            point["_cluster_group"] = info.get("group", "")
+            point["_cluster_local"] = info.get("local", labels[i])
         points.append(point)
 
     return ClusterResponse(
@@ -267,4 +308,6 @@ def run_clustering(request: ClusterRequest) -> ClusterResponse:
         pca_coords=pca_coords,
         pca_variance_explained=pca_variance,
         dims=dims,
+        group_cluster_map=group_cluster_map,
+        group_by_field=group_by_field,
     )

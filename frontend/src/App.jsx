@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { parseData, clusterData } from './api/client'
-import { clusterColor } from './utils/colors'
+import { clusterColor, groupHashColor } from './utils/colors'
 import ClusterChart from './components/ClusterChart'
 import ClusterConfig from './components/ClusterConfig'
 import ColumnSelector from './components/ColumnSelector'
@@ -14,8 +14,8 @@ export default function App() {
   const [rawData, setRawData] = useState(null)
   const [schema, setSchema] = useState(null)
   const [selectedColumns, setSelectedColumns] = useState([])
-  const [selectedCategoricalColumns, setSelectedCategoricalColumns] = useState([])
-  const [weights, setWeights] = useState({})          // { colName: number }
+  const [groupByField, setGroupByField] = useState(null)
+  const [weights, setWeights] = useState({})
   const [config, setConfig] = useState({
     algorithm: 'kmeans',
     n_clusters: 3,
@@ -38,6 +38,7 @@ export default function App() {
       setSchema(schemaResult)
       setSelectedColumns(numericCols)
       setWeights(Object.fromEntries(numericCols.map((c) => [c, 1.0])))
+      setGroupByField(null)
       setStep(1)
     } catch (e) {
       setError(e.message)
@@ -50,17 +51,6 @@ export default function App() {
     setSelectedColumns(cols)
     setWeights((prev) => {
       const next = {}
-      cols.forEach((c) => { next[c] = prev[c] ?? 1.0 })
-      selectedCategoricalColumns.forEach((c) => { next[c] = prev[c] ?? 1.0 })
-      return next
-    })
-  }
-
-  const handleCategoricalSelectionChange = (cols) => {
-    setSelectedCategoricalColumns(cols)
-    setWeights((prev) => {
-      const next = {}
-      selectedColumns.forEach((c) => { next[c] = prev[c] ?? 1.0 })
       cols.forEach((c) => { next[c] = prev[c] ?? 1.0 })
       return next
     })
@@ -77,7 +67,7 @@ export default function App() {
       const result = await clusterData({
         data: rawData,
         columns: selectedColumns,
-        categorical_columns: selectedCategoricalColumns.length > 0 ? selectedCategoricalColumns : undefined,
+        group_by: groupByField || undefined,
         weights,
         ...config,
       })
@@ -95,11 +85,16 @@ export default function App() {
     setRawData(null)
     setSchema(null)
     setSelectedColumns([])
-    setSelectedCategoricalColumns([])
+    setGroupByField(null)
     setWeights({})
     setResults(null)
     setError(null)
   }
+
+  // For ClusterConfig: cardinality of group-by field
+  const groupByCardinality = groupByField && schema
+    ? schema.columns.find((c) => c.name === groupByField)?.cardinality ?? null
+    : null
 
   return (
     <div className="min-h-screen bg-slate-950">
@@ -166,10 +161,10 @@ export default function App() {
               <ColumnSelector
                 schema={schema}
                 selectedColumns={selectedColumns}
-                selectedCategoricalColumns={selectedCategoricalColumns}
+                groupByField={groupByField}
                 weights={weights}
                 onSelectionChange={handleSelectionChange}
-                onCategoricalSelectionChange={handleCategoricalSelectionChange}
+                onGroupByChange={setGroupByField}
                 onWeightChange={handleWeightChange}
               />
             </div>
@@ -178,7 +173,8 @@ export default function App() {
                 config={config}
                 onConfigChange={setConfig}
                 selectedCount={selectedColumns.length}
-                selectedCategoricalCount={selectedCategoricalColumns.length}
+                groupByField={groupByField}
+                groupByCardinality={groupByCardinality}
                 weights={weights}
                 onRun={handleRunClustering}
                 loading={loading}
@@ -221,7 +217,6 @@ export default function App() {
 
 function countRecords(data) {
   if (Array.isArray(data)) return data.length
-  // nested — try to count the largest array
   let max = 0
   const walk = (obj) => {
     if (Array.isArray(obj)) { if (obj.length > max) max = obj.length; return }
@@ -241,12 +236,79 @@ function StatCard({ label, value }) {
 }
 
 function ClusterDistribution({ results }) {
-  const total = results.labels.length
+  const { labels, cluster_counts, group_cluster_map, group_by_field } = results
+  const total = labels.length
+
+  if (group_cluster_map) {
+    // Build hierarchy: group → [{ globalId, local, count }]
+    const byGroup = {}
+    Object.entries(group_cluster_map).forEach(([gid, info]) => {
+      const g = info.group
+      if (!byGroup[g]) byGroup[g] = []
+      byGroup[g].push({ gid, local: info.local, count: cluster_counts[gid] ?? 0 })
+    })
+
+    return (
+      <div className="card">
+        <h3 className="text-slate-300 font-semibold mb-1">
+          Cluster Distribution
+        </h3>
+        {group_by_field && (
+          <p className="text-xs text-cyan-500 mb-4">
+            Agrupado por <span className="font-mono">{group_by_field.split('.').pop()}</span>
+            {' · '}{Object.keys(byGroup).length} grupos
+          </p>
+        )}
+        <div className="space-y-4 max-h-96 overflow-y-auto pr-1">
+          {Object.entries(byGroup)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([groupName, clusters]) => {
+              const groupTotal = clusters.reduce((s, c) => s + c.count, 0)
+              const groupPct = ((groupTotal / total) * 100).toFixed(1)
+              const color = groupHashColor(groupName)
+              return (
+                <div key={groupName}>
+                  <div className="flex justify-between items-baseline mb-1.5">
+                    <span className="text-sm font-semibold" style={{ color }}>{groupName}</span>
+                    <span className="text-xs text-slate-500">
+                      {groupTotal.toLocaleString()} · {groupPct}%
+                    </span>
+                  </div>
+                  <div className="pl-3 border-l-2 space-y-1.5" style={{ borderColor: color + '50' }}>
+                    {clusters
+                      .sort((a, b) => a.local - b.local)
+                      .map(({ gid, local, count }) => {
+                        const pct = ((count / total) * 100).toFixed(1)
+                        return (
+                          <div key={gid}>
+                            <div className="flex justify-between text-xs mb-0.5">
+                              <span className="text-slate-500">Cluster {local}</span>
+                              <span className="text-slate-600">{count.toLocaleString()} · {pct}%</span>
+                            </div>
+                            <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                              <div
+                                className="h-full rounded-full"
+                                style={{ width: `${((count / groupTotal) * 100).toFixed(1)}%`, backgroundColor: color + 'b0' }}
+                              />
+                            </div>
+                          </div>
+                        )
+                      })}
+                  </div>
+                </div>
+              )
+            })}
+        </div>
+      </div>
+    )
+  }
+
+  // Standard flat distribution
   return (
     <div className="card">
       <h3 className="text-slate-300 font-semibold mb-4">Cluster Distribution</h3>
       <div className="space-y-3">
-        {Object.entries(results.cluster_counts)
+        {Object.entries(cluster_counts)
           .sort((a, b) => parseInt(a[0]) - parseInt(b[0]))
           .map(([cluster, count]) => {
             const pct = ((count / total) * 100).toFixed(1)
@@ -257,15 +319,10 @@ function ClusterDistribution({ results }) {
                   <span className="font-medium" style={{ color }}>
                     {cluster === '-1' ? 'Noise' : `Cluster ${cluster}`}
                   </span>
-                  <span className="text-slate-400">
-                    {count.toLocaleString()} pts · {pct}%
-                  </span>
+                  <span className="text-slate-400">{count.toLocaleString()} pts · {pct}%</span>
                 </div>
                 <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
-                  <div
-                    className="h-full rounded-full transition-all duration-700"
-                    style={{ width: `${pct}%`, backgroundColor: color }}
-                  />
+                  <div className="h-full rounded-full transition-all duration-700" style={{ width: `${pct}%`, backgroundColor: color }} />
                 </div>
               </div>
             )
